@@ -60,6 +60,12 @@ python save_jit.py --exptid xxx-xx
 ```
 This will save the models in `legged_gym/logs/parkour_new/xxx-xx/traced/`.
 
+lib 11.8问题：
+在当前 parkour 环境中执行：
+export NVRTC_LIB="$CONDA_PREFIX/lib/python3.8/site-packages/torch/lib"
+export LD_LIBRARY_PATH="$NVRTC_LIB:$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
+echo "$LD_LIBRARY_PATH"
+
 ### Viewer Usage
 Can be used in both IsaacGym and web viewer.
 - `ALT + Mouse Left + Drag Mouse`: move view.
