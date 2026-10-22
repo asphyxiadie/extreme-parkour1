@@ -60,6 +60,15 @@ python save_jit.py --exptid xxx-xx
 ```
 This will save the models in `legged_gym/logs/parkour_new/xxx-xx/traced/`.
 
+conda activate parkour
+cd ~/extreme-parkour1/legged_gym/legged_gym/scripts
+
+# Phase 1：base / teacher
+python play.py --task go2 --exptid go2-attn-01 --delay
+
+# Phase 2：distillation / student（深度相机）
+python play.py --task go2 --exptid go2-vision-01 --delay --use_camera
+
 lib 11.8问题：
 在当前 parkour 环境中执行：
 export NVRTC_LIB="$CONDA_PREFIX/lib/python3.8/site-packages/torch/lib"
