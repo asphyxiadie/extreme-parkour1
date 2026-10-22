@@ -85,6 +85,31 @@ class StateHistoryEncoder(nn.Module):
         output = self.linear_output(output)
         return output
 
+class ScandotProprioAttention(nn.Module):
+    """Use proprioception to attend to patches of terrain height samples."""
+
+    def __init__(self, num_scan, num_prop, embed_dim, num_heads=4):
+        super().__init__()
+        if embed_dim % num_heads != 0:
+            raise ValueError("scan embedding size must be divisible by the number of attention heads")
+
+        # The configured scandots form a 12 x 11 grid. Group each row of 11
+        # heights into one token to keep attention affordable during PPO updates.
+        self.patch_size = 11 if num_scan % 11 == 0 else 1
+        num_tokens = num_scan // self.patch_size
+        self.scan_projection = nn.Linear(self.patch_size, embed_dim)
+        self.scan_position = nn.Parameter(torch.zeros(1, num_tokens, embed_dim))
+        nn.init.normal_(self.scan_position, std=0.02)
+        self.proprio_projection = nn.Linear(num_prop, embed_dim)
+        self.attention = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
+        self.output_norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, scan, proprioception):
+        scan_tokens = self.scan_projection(scan.reshape(scan.shape[0], -1, self.patch_size)) + self.scan_position
+        proprio_query = self.proprio_projection(proprioception).unsqueeze(1)
+        attended, _ = self.attention(proprio_query, scan_tokens, scan_tokens, need_weights=False)
+        return torch.tanh(self.output_norm(proprio_query + attended).squeeze(1))
+
 class Actor(nn.Module):
     def __init__(self, num_prop, 
                  num_scan, 
@@ -123,17 +148,7 @@ class Actor(nn.Module):
         self.history_encoder = StateHistoryEncoder(activation, num_prop, num_hist, priv_encoder_output_dim)
 
         if self.if_scan_encode:
-            scan_encoder = []
-            scan_encoder.append(nn.Linear(num_scan, scan_encoder_dims[0]))
-            scan_encoder.append(activation)
-            for l in range(len(scan_encoder_dims) - 1):
-                if l == len(scan_encoder_dims) - 2:
-                    scan_encoder.append(nn.Linear(scan_encoder_dims[l], scan_encoder_dims[l+1]))
-                    scan_encoder.append(nn.Tanh())
-                else:
-                    scan_encoder.append(nn.Linear(scan_encoder_dims[l], scan_encoder_dims[l + 1]))
-                    scan_encoder.append(activation)
-            self.scan_encoder = nn.Sequential(*scan_encoder)
+            self.scan_encoder = ScandotProprioAttention(num_scan, num_prop, scan_encoder_dims[-1])
             self.scan_encoder_output_dim = scan_encoder_dims[-1]
         else:
             self.scan_encoder = nn.Identity()
@@ -161,7 +176,7 @@ class Actor(nn.Module):
             if self.if_scan_encode:
                 obs_scan = obs[:, self.num_prop:self.num_prop + self.num_scan]
                 if scandots_latent is None:
-                    scan_latent = self.scan_encoder(obs_scan)   
+                    scan_latent = self.scan_encoder(obs_scan, obs[:, :self.num_prop])
                 else:
                     scan_latent = scandots_latent
                 obs_prop_scan = torch.cat([obs[:, :self.num_prop], scan_latent], dim=1)
@@ -179,7 +194,7 @@ class Actor(nn.Module):
             if self.if_scan_encode:
                 obs_scan = obs[:, self.num_prop:self.num_prop + self.num_scan]
                 if scandots_latent is None:
-                    scan_latent = self.scan_encoder(obs_scan)   
+                    scan_latent = self.scan_encoder(obs_scan, obs[:, :self.num_prop])
                 else:
                     scan_latent = scandots_latent
                 obs_prop_scan = torch.cat([obs[:, :self.num_prop], scan_latent], dim=1)
@@ -204,6 +219,8 @@ class Actor(nn.Module):
     
     def infer_scandots_latent(self, obs):
         scan = obs[:, self.num_prop:self.num_prop + self.num_scan]
+        if self.if_scan_encode:
+            return self.scan_encoder(scan, obs[:, :self.num_prop])
         return self.scan_encoder(scan)
 
 class ActorCriticRMA(nn.Module):
