@@ -26,6 +26,8 @@ pip install "numpy<1.24" pydelatin wandb tqdm opencv-python ipdb pyfqmr flask
 
 ### Usage ###
 `cd legged_gym/scripts`
+To train with the Go2 URDF, select the Go2 task with `--task go2` (for example, `python train.py --task go2 --exptid xxx-xx-go2 --device cuda:0`).
+
 1. Train base policy:  
 ```bash
 python train.py --exptid xxx-xx-WHATEVER --device cuda:0
