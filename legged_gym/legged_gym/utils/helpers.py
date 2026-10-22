@@ -198,7 +198,7 @@ def get_args():
 
         {"name": "--rows", "type": int, "help": "num_rows."},
         {"name": "--cols", "type": int, "help": "num_cols"},
-        {"name": "--debug", "action": "store_true", "default": False, "help": "Disable wandb logging"},
+        {"name": "--debug", "action": "store_true", "default": False, "help": "Use a smaller number of environments and terrain tiles"},
         {"name": "--proj_name", "type": str,  "default": "parkour_new", "help": "run folder name."},
         
         {"name": "--teacher", "type": str, "help": "Name of the teacher policy to use when distilling"},
@@ -219,9 +219,6 @@ def get_args():
         {"name": "--hitid", "type": str, "default": None, "help": "exptid fot hitting policy"},
 
         {"name": "--web", "action": "store_true", "default": False, "help": "if use web viewer"},
-        {"name": "--no_wandb", "action": "store_true", "default": False, "help": "no wandb"}
-
-
     ]
     # parse arguments
     args = parse_arguments(

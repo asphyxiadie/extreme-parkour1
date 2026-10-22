@@ -21,12 +21,14 @@ cd extreme-parkour
 cd isaacgym/python && pip install -e .
 cd ~/extreme-parkour/rsl_rl && pip install -e .
 cd ~/extreme-parkour/legged_gym && pip install -e .
-pip install "numpy<1.24" pydelatin wandb tqdm opencv-python ipdb pyfqmr flask
+pip install "numpy<1.24" pydelatin tensorboard tensorboardX tqdm opencv-python ipdb pyfqmr flask
 ```
 
 ### Usage ###
 `cd legged_gym/scripts`
 To train with the Go2 URDF, select the Go2 task with `--task go2` (for example, `python train.py --task go2 --exptid xxx-xx-go2 --device cuda:0`).
+
+Training metrics are saved as TensorBoard events in `legged_gym/logs/<proj_name>/<exptid>/`. From the repository root, view them with `tensorboard --logdir legged_gym/logs`.
 
 1. Train base policy:  
 ```bash
@@ -72,7 +74,6 @@ Can be used in both IsaacGym and web viewer.
 - --checkpoint: the specific checkpoint you want to load. If not specified load the latest one.
 - --resume: resume from another checkpoint, used together with `--resumeid`.
 - --seed: random seed.
-- --no_wandb: no wandb logging.
 - --use_camera: use camera or scandots.
 - --web: used for playing on headless machines. It will forward a port with vscode and you can visualize seemlessly in vscode with your idle gpu or cpu. [Live Preview](https://marketplace.visualstudio.com/items?itemName=ms-vscode.live-server) vscode extension required, otherwise you can view it in any browser.
 
