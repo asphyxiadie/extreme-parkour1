@@ -30,6 +30,23 @@ To train with the Go2 URDF, select the Go2 task with `--task go2` (for example, 
 
 Training metrics are saved as TensorBoard events in `legged_gym/logs/<proj_name>/<exptid>/`. From the repository root, view them with `tensorboard --logdir legged_gym/logs`.
 
+# 先做两轮冒烟训练
+python train.py --task go2 --exptid go2-smoke \
+  --device cuda:0 --rl_device cuda:0 --debug --max_iterations 2
+
+# Phase 1：训练教师策略
+python train.py --task go2 --exptid go2-attn-01 \
+  --device cuda:0 --rl_device cuda:0 --num_envs 4096 --max_iterations 15000
+
+# Phase 2：从教师检查点训练视觉学生
+python train.py --task go2 --exptid go2-vision-01 \
+  --device cuda:0 --rl_device cuda:0 \
+  --resume --resumeid go2-attn-01 --delay --use_camera \
+  --max_iterations 5000
+
+# 查看训练曲线
+tensorboard --logdir ~/extreme-parkour1/legged_gym/logs/parkour_new --port 6006
+
 1. Train base policy:  
 ```bash
 python train.py --exptid xxx-xx-WHATEVER --device cuda:0
