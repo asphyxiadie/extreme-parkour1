@@ -3,6 +3,30 @@ import torch.nn as nn
 import sys
 import torchvision
 
+
+class TerrainMoE(nn.Module):
+    """Enhance the 32-D terrain latent with a dense, four-expert residual MoE."""
+
+    def __init__(self, input_dim=32, hidden_dim=64, output_dim=32, num_experts=4):
+        super().__init__()
+        self.experts = nn.ModuleList([
+            nn.Sequential(nn.Linear(input_dim, hidden_dim), nn.ELU(), nn.Linear(hidden_dim, output_dim))
+            for _ in range(num_experts)
+        ])
+        self.router = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim), nn.ELU(), nn.Linear(hidden_dim, num_experts)
+        )
+        self.residual_scale = nn.Parameter(torch.tensor(0.1))
+        self.last_gate_weights = None
+
+    def forward(self, terrain_latent):
+        gate_weights = torch.softmax(self.router(terrain_latent), dim=-1)
+        self.last_gate_weights = gate_weights.detach()
+        expert_outputs = torch.stack([expert(terrain_latent) for expert in self.experts], dim=1)
+        mixed_terrain = torch.sum(gate_weights.unsqueeze(-1) * expert_outputs, dim=1)
+        return terrain_latent + self.residual_scale * mixed_terrain
+
+
 class RecurrentDepthBackbone(nn.Module):
     def __init__(self, base_backbone, env_cfg) -> None:
         super().__init__()
@@ -26,6 +50,7 @@ class RecurrentDepthBackbone(nn.Module):
                                 nn.Linear(512, 32+2),
                                 last_activation
                             )
+        self.terrain_moe = TerrainMoE()
         self.hidden_states = None
 
     def forward(self, depth_image, proprioception):
@@ -33,9 +58,10 @@ class RecurrentDepthBackbone(nn.Module):
         depth_latent = self.combination_mlp(torch.cat((depth_image, proprioception), dim=-1))
         # depth_latent = self.base_backbone(depth_image)
         depth_latent, self.hidden_states = self.rnn(depth_latent[:, None, :], self.hidden_states)
-        depth_latent = self.output_mlp(depth_latent.squeeze(1))
-        
-        return depth_latent
+        output = self.output_mlp(depth_latent.squeeze(1))
+        # Only the terrain latent is enhanced; the original heading stays intact.
+        terrain_latent = self.terrain_moe(output[:, :32])
+        return torch.cat((terrain_latent, output[:, 32:34]), dim=-1)
 
     def detach_hidden_states(self):
         self.hidden_states = self.hidden_states.detach().clone()

@@ -330,7 +330,7 @@ class PPO:
 
             self.depth_actor_optimizer.zero_grad()
             loss.backward()
-            nn.utils.clip_grad_norm_(self.depth_actor.parameters(), self.max_grad_norm)
+            nn.utils.clip_grad_norm_([*self.depth_actor.parameters(), *self.depth_encoder.parameters()], self.max_grad_norm)
             self.depth_actor_optimizer.step()
             return depth_actor_loss.item(), yaw_loss.item()
     
