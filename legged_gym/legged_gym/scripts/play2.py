@@ -34,7 +34,7 @@ STEP_FIELDS = ('model', 'env_id', 'terrain', 'terrain_level', 'episode_id', 'ste
                'target_x', 'target_y', 'command_vx', 'actual_vx', 'world_vx',
                'roll_rad', 'pitch_rad', 'yaw_rad', 'ang_vel_x', 'ang_vel_y',
                'body_contact_force_n', 'collision', 'collision_start',
-               'action_delta_abs_mean', 'done', 'video_frame')
+               'action_delta_abs_mean', 'depth_fresh', 'done', 'video_frame')
 
 
 def snapshot(env, index):
@@ -75,7 +75,6 @@ class RecordingRobot(LeggedRobot):
             props = gymapi.CameraProperties()
             props.width = self.cfg.record_video_width
             props.height = self.cfg.record_video_height
-            props.horizontal_fov = 80
             camera = self.gym.create_camera_sensor(handle, props)
             if camera < 0:
                 raise RuntimeError(f'Cannot create recording camera for env {index}')
@@ -88,36 +87,45 @@ class RecordingRobot(LeggedRobot):
 
 
 class VideoRecorder:
-    def __init__(self, env, output, width, height, stride):
+    def __init__(self, env, output, width, height, stride, record_depth=False):
         self.env, self.output = env, output
         self.width, self.height, self.stride = width, height, stride
+        self.record_depth = record_depth
+        self.depth_width = width // 2 if record_depth else 0
         self.cameras = env.record_cameras
         self.writers = [None] * env.num_envs
         self.frames = [0] * env.num_envs
+        self.latest_depth = [None] * env.num_envs
         self.fps = max(1, round(1 / (env.dt * stride)))
         (output / 'videos').mkdir(parents=True, exist_ok=True)
 
     def _open(self, index, episode_id, terrain):
         path = self.output / 'videos' / f'env{index}_{terrain}_episode{episode_id:02d}.mp4'
         writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*'mp4v'),
-                                 self.fps, (self.width, self.height))
+                                 self.fps, (self.width + self.depth_width, self.height))
         if not writer.isOpened():
             raise RuntimeError(f'Cannot open MP4 writer: {path}')
         self.writers[index] = writer
         self.frames[index] = 0
         return path
 
-    def capture(self, counts, lengths, terrains, active):
+    def capture(self, counts, lengths, terrains, active, depth_input=None):
         """Capture the current state before the next control step can reset an episode."""
+        if self.record_depth and depth_input is not None:
+            images = depth_input.detach().cpu().numpy()
+            for index in range(self.env.num_envs):
+                if active[index]:
+                    self.latest_depth[index] = images[index].copy()
         due = [i for i in range(self.env.num_envs)
                if active[i] and lengths[i] % self.stride == 0]
         if not due:
             return
         for index in due:
             root = self.env.root_states[index, :3].detach().cpu().numpy()
-            y = float(root[1])
-            camera_pos = gymapi.Vec3(float(root[0]) - 2.2, y + 3.8, 2.1)
-            look_at = gymapi.Vec3(float(root[0]) + 1.0, y, 0.35)
+            # Match BaseTask.lookat(): its initial viewer follow offset is [0, 2, 1].
+            camera_pos = gymapi.Vec3(float(root[0]), float(root[1]) + 2.0,
+                                     float(root[2]) + 1.0)
+            look_at = gymapi.Vec3(float(root[0]), float(root[1]), float(root[2]))
             self.env.gym.set_camera_location(self.cameras[index], self.env.envs[index],
                                              camera_pos, look_at)
         self.env.gym.step_graphics(self.env.sim)
@@ -129,10 +137,24 @@ class VideoRecorder:
                                                 self.cameras[index], gymapi.IMAGE_COLOR)
             rgba = np.asarray(raw).reshape(self.height, self.width, 4)
             frame = cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGR)
-            cv2.putText(frame, f'{terrains[index]}  env {index}  episode {counts[index] + 1}',
-                        (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+            if self.record_depth:
+                panel = self.depth_panel(self.latest_depth[index])
+                frame = np.concatenate((frame, panel), axis=1)
             self.writers[index].write(frame)
             self.frames[index] += 1
+
+    def depth_panel(self, depth):
+        if depth is None:
+            gray = np.zeros((self.height, self.depth_width), dtype=np.uint8)
+        else:
+            # The depth encoder receives values in approximately [-0.5, 0.5].
+            gray = np.clip((depth + 0.5) * 255, 0, 255).astype(np.uint8)
+            gray = cv2.resize(gray, (self.depth_width, self.height),
+                              interpolation=cv2.INTER_NEAREST)
+        panel = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+        cv2.putText(panel, 'DEPTH INPUT', (12, 28), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55, (255, 255, 255), 2)
+        return panel
 
     def close_episode(self, index):
         frames = self.frames[index]
@@ -140,6 +162,7 @@ class VideoRecorder:
             self.writers[index].release()
             self.writers[index] = None
         self.frames[index] = 0
+        self.latest_depth[index] = None
         return frames
 
     def close(self):
@@ -267,6 +290,9 @@ def make_cfg(args, opts, model):
     cfg.domain_rand.push_robots = False
     cfg.domain_rand.randomize_base_mass = False
     cfg.domain_rand.randomize_base_com = False
+    cfg.domain_rand.action_delay = args.delay
+    if args.delay:
+        cfg.domain_rand.action_curr_step = [1]
     cfg.seed = args.seed if args.seed is not None else train_cfg.seed
     train_cfg.depth_encoder.if_depth = model == 'moe'
     train_cfg.runner.resume = False
@@ -274,6 +300,7 @@ def make_cfg(args, opts, model):
 
 
 def run_model(model, checkpoint, opts, args, output):
+    args.use_camera = model == 'moe'
     cfg, train_cfg = make_cfg(args, opts, model)
     set_seed(cfg.seed)
     params = parse_sim_params(args, {'sim': class_to_dict(cfg.sim)})
@@ -313,7 +340,7 @@ def run_model(model, checkpoint, opts, args, output):
             actor = runner.get_actor_critic(device=env.device).actor
             depth = None
         recorder = VideoRecorder(env, run_dir, opts.video_width, opts.video_height,
-                                 opts.video_stride)
+                                 opts.video_stride, record_depth=model == 'moe')
         obs = env.get_observations()
         counts = [0] * 4
         lengths = [0] * 4
@@ -326,7 +353,7 @@ def run_model(model, checkpoint, opts, args, output):
             writer.writeheader()
             while min(counts) < opts.episodes:
                 recording = [n < opts.episodes for n in counts]
-                recorder.capture(counts, lengths, classes, recording)
+                recorder.capture(counts, lengths, classes, recording, depth_input=depth)
                 actor_obs = obs.clone()
                 if encoder is not None:
                     if depth is not None:
@@ -357,7 +384,8 @@ def run_model(model, checkpoint, opts, args, output):
                                step=lengths[index] + 1, time_s=(lengths[index] + 1) * env.dt,
                                collision=int(collision),
                                collision_start=int(collision and not previous_collision[index]),
-                               action_delta_abs_mean=delta, done=int(index in done_ids),
+                               action_delta_abs_mean=delta, depth_fresh=int(depth is not None),
+                               done=int(index in done_ids),
                                video_frame=int(lengths[index] % opts.video_stride == 0))
                     writer.writerow(row)
                     active[index].append(dict(row, timed_out=state['timed_out']))
@@ -410,8 +438,16 @@ def run_model(model, checkpoint, opts, args, output):
             fixed_difficulty=args.fixed_difficulty,
             default_difficulty_range=[0.7, 1.0] if args.fixed_difficulty is None else None,
             collision_threshold_n=opts.collision_threshold, control_dt_s=env.dt,
+            action_delay_enabled=cfg.domain_rand.action_delay,
+            depth_camera_enabled=cfg.depth.use_camera,
             video_fps=recorder.fps, video_stride=opts.video_stride,
+            video_camera_follow_offset_m=[0.0, 2.0, 1.0],
+            video_camera_fov='Isaac Gym CameraProperties default, as in the play.py viewer',
+            video_layout=('third-person left + policy depth input right' if encoder is not None
+                          else 'third-person only'),
             video_note='Frames show the state before each sampled control step; the terminal state is in steps.csv.',
+            depth_video_note=('The right panel holds the most recent depth input between camera updates; '
+                              'it is blank after reset until the next input.' if encoder is not None else None),
             success_rule='goal_index >= num_goals and no fall; timeout excludes success',
             action_smoothness='mean absolute change in the 12 policy actions per control step',
             depth_update_interval=cfg.depth.update_interval if encoder is not None else None,
