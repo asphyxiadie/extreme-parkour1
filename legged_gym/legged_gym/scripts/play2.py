@@ -14,24 +14,29 @@ import sys
 from pathlib import Path
 
 import isaacgym  # noqa: F401 -- must precede torch
-from isaacgym import gymapi
+from isaacgym import gymapi, terrain_utils
 import cv2
 import numpy as np
 import torch
 
 from legged_gym import LEGGED_GYM_ROOT_DIR
 from legged_gym.envs import task_registry
+from legged_gym.envs.base import legged_robot as robot_module
 from legged_gym.envs.base.legged_robot import LeggedRobot
 from legged_gym.utils import get_args
 from legged_gym.utils.helpers import class_to_dict, parse_sim_params, set_seed
+from legged_gym.utils.terrain import Terrain, parkour_gap_terrain
 
 
 TERRAIN_NAMES = {15: 'parkour', 16: 'parkour_hurdle', 18: 'parkour_step',
                  19: 'parkour_gap', 20: 'demo'}
 LANE_NAMES = ('parkour', 'parkour_hurdle', 'parkour_step', 'parkour_gap')
+GAP_DEPTH_M = 1.0
 STEP_FIELDS = ('model', 'env_id', 'terrain', 'terrain_level', 'episode_id', 'step',
                'time_s', 'goal_index', 'position_x', 'position_y', 'position_z',
-               'target_x', 'target_y', 'command_vx', 'actual_vx', 'world_vx',
+               'target_x', 'target_y', 'final_goal_x', 'final_goal_y',
+               'final_goal_distance_m', 'success_condition',
+               'command_vx', 'actual_vx', 'world_vx',
                'roll_rad', 'pitch_rad', 'yaw_rad', 'ang_vel_x', 'ang_vel_y',
                'body_contact_force_n', 'collision', 'collision_start',
                'action_delta_abs_mean', 'depth_fresh', 'done', 'video_frame')
@@ -41,6 +46,7 @@ def snapshot(env, index):
     root = env.root_states[index]
     goal_index = int(env.cur_goal_idx[index].item())
     goal = env.env_goals[index, min(goal_index, env.cfg.terrain.num_goals - 1)]
+    final_goal = env.env_goals[index, env.cfg.terrain.num_goals - 1]
     forces = env.contact_forces[index, env.termination_contact_indices]
     force = float(torch.linalg.vector_norm(forces, dim=-1).max().item()) if forces.numel() else 0.0
     terrain_class = int(env.env_class[index].item())
@@ -51,6 +57,9 @@ def snapshot(env, index):
         position_x=float(root[0].item()), position_y=float(root[1].item()),
         position_z=float(root[2].item()),
         target_x=float(goal[0].item()), target_y=float(goal[1].item()),
+        final_goal_x=float(final_goal[0].item()), final_goal_y=float(final_goal[1].item()),
+        final_goal_distance_m=float(torch.norm(root[:2] - final_goal[:2]).item()),
+        success_condition=bool(env.play2_success_buf[index].item()),
         command_vx=float(env.commands[index, 0].item()),
         actual_vx=float(env.base_lin_vel[index, 0].item()),
         world_vx=float(root[7].item()),
@@ -62,11 +71,50 @@ def snapshot(env, index):
         timed_out=bool(env.time_out_buf[index].item()))
 
 
+class Play2FixedGapTerrain(Terrain):
+    def make_terrain(self, choice, difficulty):
+        if not self.proportions[17] <= choice < self.proportions[18]:
+            return super().make_terrain(choice, difficulty)
+
+        tile = terrain_utils.SubTerrain(
+            'terrain', width=self.length_per_env_pixels,
+            length=self.width_per_env_pixels,
+            vertical_scale=self.cfg.vertical_scale,
+            horizontal_scale=self.cfg.horizontal_scale)
+        parkour_gap_terrain(
+            tile, num_gaps=self.num_goals - 2,
+            gap_size=0.1 + 0.7 * difficulty,
+            gap_depth=[GAP_DEPTH_M, GAP_DEPTH_M], pad_height=0,
+            x_range=[0.8, 1.5], y_range=self.cfg.y_range,
+            half_valid_width=[0.6, 1.2])
+        floor_height = -round(GAP_DEPTH_M / self.cfg.vertical_scale)
+        gap_cells = tile.height_field_raw == floor_height
+        self.add_roughness(tile)
+        tile.height_field_raw[gap_cells] = floor_height
+        tile.idx = 19
+        return tile
+
+
 class RecordingRobot(LeggedRobot):
+    def check_termination(self):
+        super().check_termination()
+        final_goal = self.env_goals[:, self.cfg.terrain.num_goals - 1, :2]
+        final_distance = torch.norm(self.root_states[:, :2] - final_goal, dim=1)
+        self.play2_success_buf = (
+            (self.cur_goal_idx >= self.cfg.terrain.num_goals - 1)
+            & (final_distance < self.cfg.env.next_goal_threshold))
+        self.time_out_buf |= self.play2_success_buf
+        self.reset_buf |= self.play2_success_buf
+
     def create_sim(self):
         # Headless video still needs a graphics context, including for the teacher.
         self.graphics_device_id = self.sim_device_id
-        super().create_sim()
+        original_terrain = robot_module.Terrain
+        try:
+            robot_module.Terrain = Play2FixedGapTerrain
+            super().create_sim()
+        finally:
+            robot_module.Terrain = original_terrain
 
     def _create_envs(self):
         super()._create_envs()
@@ -237,7 +285,7 @@ def write_csv(path, rows):
 def summarize_episode(model, env_id, episode_id, rows, last, dt, num_goals, frames):
     fallen = (abs(last['roll_rad']) > 1.5 or abs(last['pitch_rad']) > 1.5
               or last['position_z'] < -0.25)
-    reason = ('fall' if fallen else 'success' if last['goal_index'] >= num_goals
+    reason = ('fall' if fallen else 'success' if last['success_condition']
               else 'timeout' if last['timed_out'] else 'other')
     mean = lambda key: sum(r[key] for r in rows) / len(rows)
     action_deltas = [r['action_delta_abs_mean'] for r in rows
@@ -246,7 +294,8 @@ def summarize_episode(model, env_id, episode_id, rows, last, dt, num_goals, fram
                 terrain_level=rows[0]['terrain_level'], episode_id=episode_id,
                 reason=reason, success=int(reason == 'success'),
                 elapsed_s=len(rows) * dt, steps=len(rows),
-                progress=min(1.0, last['goal_index'] / num_goals),
+                progress=(1.0 if reason == 'success' else min(1.0, last['goal_index'] / num_goals)),
+                final_goal_distance_m=last['final_goal_distance_m'],
                 mean_command_vx=mean('command_vx'), mean_actual_vx=mean('actual_vx'),
                 mean_abs_speed_error=sum(abs(r['command_vx'] - r['actual_vx']) for r in rows) / len(rows),
                 collision_events=sum(r['collision_start'] for r in rows),
@@ -278,6 +327,9 @@ def make_cfg(args, opts, model):
     cfg.terrain.terrain_proportions = list(cfg.terrain.terrain_dict.values())
     cfg.terrain.curriculum = False
     cfg.terrain.max_difficulty = True
+    # play.py applies this when --use_camera is set. Use the same map for both
+    # policies so teacher/MoE comparisons start from identical terrain tiles.
+    cfg.terrain.y_range = [-0.1, 0.1]
     if args.fixed_difficulty is not None:
         cfg.terrain.fixed_difficulty = args.fixed_difficulty
     cfg.depth.use_camera = model == 'moe'
@@ -435,6 +487,8 @@ def run_model(model, checkpoint, opts, args, output):
             model=model, checkpoint=str(checkpoint), seed=cfg.seed,
             episodes_per_robot=opts.episodes, max_steps=opts.max_steps,
             terrain_names=classes, terrain_levels=[int(x.item()) for x in env.terrain_levels],
+            terrain_y_range_m=cfg.terrain.y_range,
+            parkour_gap_depth_m=GAP_DEPTH_M,
             fixed_difficulty=args.fixed_difficulty,
             default_difficulty_range=[0.7, 1.0] if args.fixed_difficulty is None else None,
             collision_threshold_n=opts.collision_threshold, control_dt_s=env.dt,
@@ -448,7 +502,9 @@ def run_model(model, checkpoint, opts, args, output):
             video_note='Frames show the state before each sampled control step; the terminal state is in steps.csv.',
             depth_video_note=('The right panel holds the most recent depth input between camera updates; '
                               'it is blank after reset until the next input.' if encoder is not None else None),
-            success_rule='goal_index >= num_goals and no fall; timeout excludes success',
+            success_rule=('first 7 goals reached, then base XY within next_goal_threshold '
+                          'of goal 8; fall takes precedence'),
+            final_goal_threshold_m=cfg.env.next_goal_threshold,
             action_smoothness='mean absolute change in the 12 policy actions per control step',
             depth_update_interval=cfg.depth.update_interval if encoder is not None else None,
         ), indent=2))
