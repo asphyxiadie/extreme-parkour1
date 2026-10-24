@@ -97,6 +97,11 @@ def play(args):
     env_cfg.terrain.terrain_proportions = list(env_cfg.terrain.terrain_dict.values())
     env_cfg.terrain.curriculum = False
     env_cfg.terrain.max_difficulty = True
+    if args.fixed_difficulty is not None:
+        if not 0 <= args.fixed_difficulty <= 1:
+            raise ValueError("--fixed-difficulty must be between 0 and 1")
+        env_cfg.terrain.fixed_difficulty = args.fixed_difficulty
+        print(f"Using fixed terrain difficulty: {args.fixed_difficulty}")
     
     env_cfg.depth.angle = [0, 1]
     env_cfg.noise.add_noise = True

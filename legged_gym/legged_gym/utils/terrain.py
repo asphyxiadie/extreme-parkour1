@@ -120,7 +120,10 @@ class Terrain:
                 difficulty = i / (self.cfg.num_rows-1)
                 choice = j / self.cfg.num_cols + 0.001
                 if random:
-                    if max_difficulty:
+                    fixed_difficulty = getattr(self.cfg, "fixed_difficulty", None)
+                    if fixed_difficulty is not None:
+                        terrain = self.make_terrain(choice, fixed_difficulty)
+                    elif max_difficulty:
                         terrain = self.make_terrain(choice, np.random.uniform(0.7, 1))
                     else:
                         terrain = self.make_terrain(choice, np.random.uniform(0, 1))

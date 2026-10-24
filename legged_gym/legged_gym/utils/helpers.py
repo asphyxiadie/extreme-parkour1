@@ -198,6 +198,7 @@ def get_args():
 
         {"name": "--rows", "type": int, "help": "num_rows."},
         {"name": "--cols", "type": int, "help": "num_cols"},
+        {"name": "--fixed-difficulty", "type": float, "default": None, "help": "Use a fixed terrain difficulty in play.py (0 to 1); omit for the original random difficulty"},
         {"name": "--debug", "action": "store_true", "default": False, "help": "Use a smaller number of environments and terrain tiles"},
         {"name": "--proj_name", "type": str,  "default": "parkour_new", "help": "run folder name."},
         
