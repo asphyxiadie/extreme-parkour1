@@ -90,12 +90,39 @@ class Go2LaneRobot(robot_module.LeggedRobot):
     def _update_terrain_curriculum(self, env_ids):
         return  # Keep each robot in its assigned lane after every reset.
 
+    def _update_goals(self):
+        # These lanes only progress in +X. A fast jump can pass a 0.2 m waypoint
+        # without spending 0.1 s inside it; the standard timer then leaves the
+        # target behind the robot and encourages a turn back toward it.
+        for _ in range(self.cfg.terrain.num_goals):
+            goal = self._gather_cur_goals()
+            passed = ((self.cur_goal_idx < self.cfg.terrain.num_goals)
+                      & (self.root_states[:, 0] >= goal[:, 0]))
+            self.cur_goal_idx += passed.long()
+        self.cur_goals = self._gather_cur_goals()
+        self.next_goals = self._gather_cur_goals(future=1)
+        self.reach_goal_timer[:] = 0
+        self.reached_goal_ids = torch.norm(
+            self.root_states[:, :2] - self.cur_goals[:, :2], dim=1
+        ) < self.cfg.env.next_goal_threshold
+        self.target_pos_rel = self.cur_goals[:, :2] - self.root_states[:, :2]
+        self.next_target_pos_rel = self.next_goals[:, :2] - self.root_states[:, :2]
+        self.target_yaw = torch.atan2(self.target_pos_rel[:, 1], self.target_pos_rel[:, 0])
+        self.next_target_yaw = torch.atan2(self.next_target_pos_rel[:, 1], self.next_target_pos_rel[:, 0])
+
     def _reset_dofs(self, ids):
         self.dof_pos[ids] = self.default_dof_pos
         self.dof_vel[ids] = 0.
         ids = ids.to(dtype=torch.int32)
         self.gym.set_dof_state_tensor_indexed(
             self.sim, gymtorch.unwrap_tensor(self.dof_state), gymtorch.unwrap_tensor(ids), len(ids))
+
+    def check_termination(self):
+        super().check_termination()
+        self.off_lane_buf = torch.abs(
+            self.root_states[:, 1] - self.env_origins[:, 1]
+        ) > (self.cfg.terrain.terrain_width / 2 - 0.2)
+        self.reset_buf |= self.off_lane_buf
 
     def reset_idx(self, ids):
         if len(ids) and getattr(self, "record_terminal", False):
@@ -109,19 +136,27 @@ def read_state(env, index):
     force = float(torch.norm(force, dim=-1).max()) if force.numel() else 0.
     roll, pitch = float(env.roll[index]), float(env.pitch[index])
     goal_index = int(env.cur_goal_idx[index])
+    target = env.env_goals[index, min(goal_index, env.cfg.terrain.num_goals - 1)]
     return dict(goal_index=goal_index, roll=roll, pitch=pitch,
                 base_height=float(env.root_states[index, 2]),
                 timed_out=bool(env.time_out_buf[index]),
                 command_x=float(env.commands[index, 0]),
+                command_yaw_rate=float(env.commands[index, 2]),
                 actual_x=float(env.base_lin_vel[index, 0]),
+                world_vx=float(env.root_states[index, 7]),
                 base_contact_force=force,
-                position_x=float(env.root_states[index, 0]))
+                position_x=float(env.root_states[index, 0]),
+                position_y=float(env.root_states[index, 1]),
+                target_x=float(target[0]), target_y=float(target[1]),
+                yaw=float(env.yaw[index]), target_yaw=float(env.target_yaw[index]),
+                off_lane=bool(env.off_lane_buf[index]))
 
 
 def finish_episode(lane, episode_id, samples, num_goals, dt):
     last = samples[-1]
     fallen = abs(last["roll"]) > 1.5 or abs(last["pitch"]) > 1.5 or last["base_height"] < -0.25
-    reason = ("fall" if fallen else "success" if last["goal_index"] >= num_goals
+    reason = ("fall" if fallen else "off_lane" if last["off_lane"]
+              else "success" if last["goal_index"] >= num_goals
               else "timeout" if last["timed_out"] else "other")
     mean = lambda key: sum(row[key] for row in samples) / len(samples)
     return dict(lane=lane, episode_id=episode_id, reason=reason,
@@ -132,6 +167,7 @@ def finish_episode(lane, episode_id, samples, num_goals, dt):
                 collision_duration_s=sum(row["collision"] for row in samples) * dt,
                 max_base_contact_force=max(row["base_contact_force"] for row in samples),
                 mean_command_x=mean("command_x"), mean_actual_x=mean("actual_x"),
+                mean_world_vx=mean("world_vx"),
                 mean_abs_speed_error=mean("abs_speed_error"),
                 mean_abs_roll=mean("abs_roll"), mean_abs_pitch=mean("abs_pitch"))
 
@@ -141,6 +177,23 @@ def write_csv(path, rows):
         writer = csv.DictWriter(output, fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
+
+
+def validate_lane_goals(env):
+    """Fail before play if a robot was assigned another lane's waypoints."""
+    expected_types = torch.arange(len(LANES), device=env.device)
+    if not torch.equal(env.terrain_types, expected_types):
+        raise RuntimeError(f"Wrong lane assignment: {env.terrain_types.tolist()}")
+    if not torch.all(env.terrain_levels == 0):
+        raise RuntimeError(f"Wrong terrain levels: {env.terrain_levels.tolist()}")
+    expected_x = torch.tensor(GOAL_X, device=env.device)
+    if not torch.allclose(env.env_goals[:, :len(GOAL_X), 0], expected_x[None, :].expand(len(LANES), -1), atol=1e-4):
+        raise RuntimeError("A lane has unexpected target X coordinates")
+    expected_y = env.env_origins[:, 1]
+    if not torch.allclose(env.env_goals[:, :len(GOAL_X), 1], expected_y[:, None].expand(-1, len(GOAL_X)), atol=1e-4):
+        raise RuntimeError("A lane has another lane's target Y coordinates")
+    return {lane: env.env_goals[index, :len(GOAL_X), :2].cpu().tolist()
+            for index, lane in enumerate(LANES)}
 
 
 def parse_args():
@@ -240,6 +293,9 @@ def main():
     env.episode_length_buf[:] = 0
     env.max_episode_length = custom.max_steps - 1
     env.max_episode_length_s = custom.max_steps * env.dt
+    lane_goals = validate_lane_goals(env)
+    for lane, goals in lane_goals.items():
+        print(f"{lane}: start goal={goals[0]}, finish goal={goals[-1]}", flush=True)
     train_cfg.runner.resume = True
     train_cfg.runner.checkpoint = args.checkpoint
     runner, _, _ = task_registry.make_alg_runner(
@@ -259,6 +315,7 @@ def main():
         depth = None
     output = Path(custom.output)
     output.mkdir(parents=True, exist_ok=True)
+    (output / "lane_goals.json").write_text(json.dumps(lane_goals, indent=2))
     obs = env.get_observations()
     counts = [0] * 4
     active = [[] for _ in LANES]
@@ -288,14 +345,23 @@ def main():
                 row = dict(lane=lane, env_id=index, episode_id=counts[index],
                            step=len(active[index]) + 1,
                            timestamp_s=(len(active[index]) + 1) * env.dt,
-                           goal_index=state["goal_index"], position_x=state["position_x"],
+                           goal_index=state["goal_index"],
+                           position_x=state["position_x"], position_y=state["position_y"],
+                           target_x=state["target_x"], target_y=state["target_y"],
                            command_x=state["command_x"], actual_x=state["actual_x"],
+                           world_vx=state["world_vx"],
+                           command_yaw_rate=state["command_yaw_rate"], yaw=state["yaw"],
+                           target_yaw=state["target_yaw"],
+                           actor_yaw_current=float(actor_obs[index, 6]),
+                           actor_yaw_next=float(actor_obs[index, 7]),
                            abs_speed_error=abs(state["command_x"] - state["actual_x"]),
                            roll=state["roll"], pitch=state["pitch"],
+                           base_height=state["base_height"], timed_out=int(state["timed_out"]),
                            abs_roll=abs(state["roll"]), abs_pitch=abs(state["pitch"]),
                            base_contact_force=state["base_contact_force"],
                            collision=int(collision),
                            collision_start=int(collision and not previous_collision[index]),
+                           off_lane=int(state["off_lane"]),
                            depth_fresh=int(depth is not None))
                 previous_collision[index] = collision
                 active[index].append(row)
@@ -322,6 +388,7 @@ def main():
         summary.append(dict(lane=lane, episodes=len(rows), successes=sum(row["success"] for row in rows),
                             success_rate=sum(row["success"] for row in rows) / len(rows),
                             fall_rate=sum(row["reason"] == "fall" for row in rows) / len(rows),
+                            off_lane_rate=sum(row["reason"] == "off_lane" for row in rows) / len(rows),
                             timeout_rate=sum(row["reason"] == "timeout" for row in rows) / len(rows),
                             mean_progress=sum(row["progress"] for row in rows) / len(rows),
                             mean_success_time_s=(sum(row["elapsed_s"] for row in successes) / len(successes)
@@ -329,6 +396,7 @@ def main():
                             mean_collision_events=sum(row["collision_events"] for row in rows) / len(rows),
                             mean_command_x=sum(row["mean_command_x"] for row in rows) / len(rows),
                             mean_actual_x=sum(row["mean_actual_x"] for row in rows) / len(rows),
+                            mean_world_vx=sum(row["mean_world_vx"] for row in rows) / len(rows),
                             mean_abs_speed_error=sum(row["mean_abs_speed_error"] for row in rows) / len(rows)))
     write_csv(output / "summary.csv", summary)
     (output / "metadata.json").write_text(json.dumps(dict(
@@ -336,6 +404,7 @@ def main():
         episodes_per_lane=custom.episodes, max_steps=custom.max_steps,
         command_x=custom.cmd_vx, collision_threshold=custom.collision_threshold,
         lanes=LANES, obstacle_centers=OBSTACLE_CENTERS, goal_x=GOAL_X,
+        goal_rule="advance when base X crosses each landing waypoint X",
         seed=cfg.seed, depth_update_interval=cfg.depth.update_interval), indent=2))
     print(f"Saved {output}")
     for row in summary:
