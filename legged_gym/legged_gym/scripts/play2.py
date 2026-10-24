@@ -1,9 +1,10 @@
-"""Record four Go2 robots on the original play.py terrain and evaluate 20 episodes each.
+"""Record Go2 play evaluation, including a single-robot MoE gap test.
 
 Examples (run from legged_gym/legged_gym/scripts):
   python play2.py --model teacher --teacher-run parkour_new/go2-attn-01 --teacher-checkpoint 14500
   python play2.py --model moe --moe-run parkour_new/go2-moe-01 --moe-checkpoint 14000
   python play2.py --model all --fixed-difficulty 0.8 --seed 1234
+  python play2.py --model moe --gap-only --fixed-difficulty 0.8 --seed 1234
 """
 
 import argparse
@@ -31,7 +32,7 @@ from legged_gym.utils.terrain import Terrain, parkour_gap_terrain
 TERRAIN_NAMES = {15: 'parkour', 16: 'parkour_hurdle', 18: 'parkour_step',
                  19: 'parkour_gap', 20: 'demo'}
 LANE_NAMES = ('parkour', 'parkour_hurdle', 'parkour_step', 'parkour_gap')
-GAP_DEPTH_M = 1.0
+GAP_DEPTH_M = 0.5
 STEP_FIELDS = ('model', 'env_id', 'terrain', 'terrain_level', 'episode_id', 'step',
                'time_s', 'goal_index', 'position_x', 'position_y', 'position_z',
                'target_x', 'target_y', 'final_goal_x', 'final_goal_y',
@@ -221,6 +222,8 @@ class VideoRecorder:
 def parse_args():
     extra = argparse.ArgumentParser(add_help=False)
     extra.add_argument('--model', choices=('teacher', 'moe', 'all'), default='all')
+    extra.add_argument('--gap-only', action='store_true',
+                       help='Evaluate only MoE on one parkour_gap robot')
     extra.add_argument('--teacher-run', default='parkour_new/go2-attn-01')
     extra.add_argument('--teacher-checkpoint', type=int, default=14500)
     extra.add_argument('--moe-run', default='parkour_new/go2-moe-01')
@@ -248,8 +251,14 @@ def parse_args():
         extra.error('--fixed-difficulty must be between 0 and 1')
     if args.graphics_device_id < 0:
         extra.error('Video recording requires a graphics device (graphics_device_id >= 0)')
+    if opts.gap_only:
+        if opts.model == 'teacher':
+            extra.error('--gap-only requires --model moe')
+        opts.model = 'moe'
+        if opts.output == '~/gpufree-data/parkour-data':
+            opts.output = '~/gpufree-data/parkour-data/moe-gap-0p5'
     args.task = 'go2'
-    args.num_envs = 4
+    args.num_envs = 1 if opts.gap_only else 4
     args.headless = True  # Offscreen cameras still render through graphics_device_id.
     args.resume = False
     args.resumeid = None
@@ -314,16 +323,19 @@ def summarize_episode(model, env_id, episode_id, rows, last, dt, num_goals, fram
 
 def make_cfg(args, opts, model):
     cfg, train_cfg = task_registry.get_cfgs('go2')
-    cfg.env.num_envs = 4
+    cfg.env.num_envs = 1 if opts.gap_only else 4
     cfg.env.episode_length_s = opts.max_steps * cfg.sim.dt * cfg.control.decimation
     cfg.commands.resampling_time = cfg.env.episode_length_s + 1
     cfg.terrain.num_rows = 5
-    cfg.terrain.num_cols = 5
+    cfg.terrain.num_cols = 1 if opts.gap_only else 5
     cfg.terrain.height = [0.02, 0.02]
     cfg.terrain.terrain_dict = dict.fromkeys(cfg.terrain.terrain_dict, 0.0)
-    cfg.terrain.terrain_dict.update({name: 0.2 for name in
-                                     ('parkour', 'parkour_hurdle', 'parkour_step',
-                                      'parkour_gap', 'demo')})
+    if opts.gap_only:
+        cfg.terrain.terrain_dict['parkour_gap'] = 1.0
+    else:
+        cfg.terrain.terrain_dict.update({name: 0.2 for name in
+                                         ('parkour', 'parkour_hurdle', 'parkour_step',
+                                          'parkour_gap', 'demo')})
     cfg.terrain.terrain_proportions = list(cfg.terrain.terrain_dict.values())
     cfg.terrain.curriculum = False
     cfg.terrain.max_difficulty = True
@@ -363,8 +375,9 @@ def run_model(model, checkpoint, opts, args, output):
     env.max_episode_length = opts.max_steps - 1
     env.max_episode_length_s = opts.max_steps * env.dt
     classes = [TERRAIN_NAMES.get(int(x.item()), str(int(x.item()))) for x in env.env_class]
-    if tuple(classes) != LANE_NAMES:
-        raise RuntimeError(f'Expected four original play2 terrain types, got {classes}')
+    expected = ('parkour_gap',) if opts.gap_only else LANE_NAMES
+    if tuple(classes) != expected:
+        raise RuntimeError(f'Expected terrain types {expected}, got {classes}')
     run_dir = output / model
     run_dir.mkdir(parents=True, exist_ok=True)
     recorder = None
@@ -394,11 +407,11 @@ def run_model(model, checkpoint, opts, args, output):
         recorder = VideoRecorder(env, run_dir, opts.video_width, opts.video_height,
                                  opts.video_stride, record_depth=model == 'moe')
         obs = env.get_observations()
-        counts = [0] * 4
-        lengths = [0] * 4
-        active = [[] for _ in range(4)]
-        previous_actions = [None] * 4
-        previous_collision = [False] * 4
+        counts = [0] * env.num_envs
+        lengths = [0] * env.num_envs
+        active = [[] for _ in range(env.num_envs)]
+        previous_actions = [None] * env.num_envs
+        previous_collision = [False] * env.num_envs
         episodes = []
         with (run_dir / 'steps.csv').open('w', newline='') as file, torch.no_grad():
             writer = csv.DictWriter(file, fieldnames=STEP_FIELDS)
@@ -420,7 +433,7 @@ def run_model(model, checkpoint, opts, args, output):
                     actions = actor(actor_obs, hist_encoding=True)
                 obs, _, _, dones, info = env.step(actions.detach())
                 done_ids = set(dones.nonzero(as_tuple=False).flatten().tolist())
-                for index in range(4):
+                for index in range(env.num_envs):
                     if counts[index] >= opts.episodes:
                         continue
                     state = (env.terminal_states[index] if index in done_ids
@@ -485,6 +498,7 @@ def run_model(model, checkpoint, opts, args, output):
         write_csv(run_dir / 'summary.csv', summary)
         (run_dir / 'metadata.json').write_text(json.dumps(dict(
             model=model, checkpoint=str(checkpoint), seed=cfg.seed,
+            gap_only=opts.gap_only, num_envs=env.num_envs,
             episodes_per_robot=opts.episodes, max_steps=opts.max_steps,
             terrain_names=classes, terrain_levels=[int(x.item()) for x in env.terrain_levels],
             terrain_y_range_m=cfg.terrain.y_range,
