@@ -27,6 +27,7 @@ from legged_gym.envs.base.legged_robot import LeggedRobot
 from legged_gym.utils import get_args
 from legged_gym.utils.helpers import class_to_dict, parse_sim_params, set_seed
 from legged_gym.utils.terrain import Terrain, parkour_gap_terrain
+from legged_gym.scripts.merge_play2_gap import merge_gap_comparison
 
 
 TERRAIN_NAMES = {15: 'parkour', 16: 'parkour_hurdle', 18: 'parkour_step',
@@ -250,6 +251,10 @@ def parse_args():
     extra.add_argument('--video-stride', type=int, default=5,
                        help='Capture one frame every N control steps')
     extra.add_argument('--output', default='~/gpufree-data/parkour-data')
+    extra.add_argument('--comparison-root', default='~/gpufree-data/parkour-data',
+                       help='Four-terrain evaluation directory to update after a gap-only run')
+    extra.add_argument('--gap-run', default='~/gpufree-data/parkour-data/moe-gap-0p5',
+                       help='Gap-only evaluation directory to use in the comparison')
     opts, remaining = extra.parse_known_args()
     original = sys.argv
     try:
@@ -566,6 +571,15 @@ def main():
         with (output / model / 'summary.csv').open(newline='') as file:
             comparison.extend(csv.DictReader(file))
     write_csv(output / 'comparison.csv', comparison)
+    comparison_root = Path(opts.comparison_root).expanduser() if opts.gap_only else output
+    gap_root = output if opts.gap_only else Path(opts.gap_run).expanduser()
+    baseline_ready = all((comparison_root / model / 'summary.csv').is_file()
+                         for model in ('teacher', 'moe'))
+    if baseline_ready and (gap_root / 'moe' / 'summary.csv').is_file():
+        merge_gap_comparison(comparison_root, gap_root)
+    elif opts.gap_only:
+        print('Gap run saved. Four-terrain baseline is not available for comparison yet; '
+              'run merge_play2_gap.py after it is available.', flush=True)
 
 
 if __name__ == '__main__':
