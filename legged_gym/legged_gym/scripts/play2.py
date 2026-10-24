@@ -33,10 +33,13 @@ TERRAIN_NAMES = {15: 'parkour', 16: 'parkour_hurdle', 18: 'parkour_step',
                  19: 'parkour_gap', 20: 'demo'}
 LANE_NAMES = ('parkour', 'parkour_hurdle', 'parkour_step', 'parkour_gap')
 GAP_DEPTH_M = 0.5
+GAP_FINISH_X_MARGIN_M = 0.5
+GAP_FINISH_Y_TOLERANCE_M = 0.6
+GAP_FINISH_MIN_BASE_HEIGHT_M = 0.2
 STEP_FIELDS = ('model', 'env_id', 'terrain', 'terrain_level', 'episode_id', 'step',
                'time_s', 'goal_index', 'position_x', 'position_y', 'position_z',
                'target_x', 'target_y', 'final_goal_x', 'final_goal_y',
-               'final_goal_distance_m', 'success_condition',
+               'final_goal_distance_m', 'success_condition', 'gap_finish_condition',
                'command_vx', 'actual_vx', 'world_vx',
                'roll_rad', 'pitch_rad', 'yaw_rad', 'ang_vel_x', 'ang_vel_y',
                'body_contact_force_n', 'collision', 'collision_start',
@@ -61,6 +64,7 @@ def snapshot(env, index):
         final_goal_x=float(final_goal[0].item()), final_goal_y=float(final_goal[1].item()),
         final_goal_distance_m=float(torch.norm(root[:2] - final_goal[:2]).item()),
         success_condition=bool(env.play2_success_buf[index].item()),
+        gap_finish_condition=bool(env.play2_gap_finish_buf[index].item()),
         command_vx=float(env.commands[index, 0].item()),
         actual_vx=float(env.base_lin_vel[index, 0].item()),
         world_vx=float(root[7].item()),
@@ -101,9 +105,19 @@ class RecordingRobot(LeggedRobot):
         super().check_termination()
         final_goal = self.env_goals[:, self.cfg.terrain.num_goals - 1, :2]
         final_distance = torch.norm(self.root_states[:, :2] - final_goal, dim=1)
-        self.play2_success_buf = (
+        waypoint_finish = (
             (self.cur_goal_idx >= self.cfg.terrain.num_goals - 1)
             & (final_distance < self.cfg.env.next_goal_threshold))
+        # Gap goals can lag behind the robot when it passes a waypoint without
+        # dwelling there. Finish on the final landing while the base is stable.
+        self.play2_gap_finish_buf = (
+            (self.env_class == 19)
+            & (self.root_states[:, 0] >= final_goal[:, 0] - GAP_FINISH_X_MARGIN_M)
+            & (torch.abs(self.root_states[:, 1] - final_goal[:, 1])
+               <= GAP_FINISH_Y_TOLERANCE_M)
+            & (self.root_states[:, 2]
+               >= self.env_origins[:, 2] + GAP_FINISH_MIN_BASE_HEIGHT_M))
+        self.play2_success_buf = waypoint_finish | self.play2_gap_finish_buf
         self.time_out_buf |= self.play2_success_buf
         self.reset_buf |= self.play2_success_buf
 
@@ -305,6 +319,8 @@ def summarize_episode(model, env_id, episode_id, rows, last, dt, num_goals, fram
                 elapsed_s=len(rows) * dt, steps=len(rows),
                 progress=(1.0 if reason == 'success' else min(1.0, last['goal_index'] / num_goals)),
                 final_goal_distance_m=last['final_goal_distance_m'],
+                success_via=('gap_finish' if reason == 'success' and last['gap_finish_condition']
+                             else 'goal_proximity' if reason == 'success' else ''),
                 mean_command_vx=mean('command_vx'), mean_actual_vx=mean('actual_vx'),
                 mean_abs_speed_error=sum(abs(r['command_vx'] - r['actual_vx']) for r in rows) / len(rows),
                 collision_events=sum(r['collision_start'] for r in rows),
@@ -516,9 +532,13 @@ def run_model(model, checkpoint, opts, args, output):
             video_note='Frames show the state before each sampled control step; the terminal state is in steps.csv.',
             depth_video_note=('The right panel holds the most recent depth input between camera updates; '
                               'it is blank after reset until the next input.' if encoder is not None else None),
-            success_rule=('first 7 goals reached, then base XY within next_goal_threshold '
-                          'of goal 8; fall takes precedence'),
+            success_rule=('For gap: base reaches final landing X/Y region above terrain; '
+                          'otherwise first 7 goals then base XY within next_goal_threshold '
+                          'of goal 8. Fall on the same step takes precedence.'),
             final_goal_threshold_m=cfg.env.next_goal_threshold,
+            gap_finish_x_margin_m=GAP_FINISH_X_MARGIN_M,
+            gap_finish_y_tolerance_m=GAP_FINISH_Y_TOLERANCE_M,
+            gap_finish_min_base_height_m=GAP_FINISH_MIN_BASE_HEIGHT_M,
             action_smoothness='mean absolute change in the 12 policy actions per control step',
             depth_update_interval=cfg.depth.update_interval if encoder is not None else None,
         ), indent=2))
