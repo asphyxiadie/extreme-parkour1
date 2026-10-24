@@ -81,10 +81,10 @@ conda activate parkour
 cd ~/extreme-parkour1/legged_gym/legged_gym/scripts
 
 # Phase 1：base / teacher
-python play.py --task go2 --exptid go2-attn-01 --delay
+python play.py --task go2 --proj_name parkour_new --exptid go2-attn-01 --checkpoint 14500 --delay
 
 # Phase 2：distillation / student（深度相机）
-python play.py --task go2 --exptid go2-vision-01 --delay --use_camera
+python play.py --task go2 --proj_name parkour_new --exptid go2-vision-01 --checkpoint 9500 --delay --use_camera
 
 lib 11.8问题：
 在当前 parkour 环境中执行：

@@ -6,9 +6,9 @@ Run from the repository root in the Isaac Gym environment:
 python legged_gym/legged_gym/scripts/play_evaluation.py \
   --model all --terrain parkour_gap --level 4 --seed 1234 \
   --episodes 20 --num-envs 4 --max-steps 3000 \
-  --teacher-run legged_gym/logs/go2-attn-01 --teacher-checkpoint 14500 \
-  --student-run legged_gym/logs/go2-vision-01 --student-checkpoint 9500 \
-  --moe-run legged_gym/logs/go2-moe-01 --moe-checkpoint 14000 \
+  --teacher-run legged_gym/logs/parkour_new/go2-attn-01 --teacher-checkpoint 14500 \
+  --student-run legged_gym/logs/parkour_new/go2-vision-01 --student-checkpoint 9500 \
+  --moe-run legged_gym/logs/parkour_new/go2-moe-01 --moe-checkpoint 14000 \
   --record-steps --record-moe --record-attention \
   --output legged_gym/evaluation/go2-gap-l4
 ```
