@@ -114,10 +114,14 @@ def configure_env(cfg, terrain, num_envs, camera, max_steps):
     cfg.commands.max_ranges.ang_vel_yaw = [0., 0.]
     cfg.commands.max_ranges.heading = [0., 0.]
     cfg.noise.add_noise = False
-    cfg.domain_rand.randomize_friction = False
+    # The observation builder always reads friction_coeffs_tensor. Keep its
+    # initialization path active, with a degenerate range for deterministic friction.
+    cfg.domain_rand.randomize_friction = True
+    cfg.domain_rand.friction_range = [1., 1.]
     cfg.domain_rand.randomize_base_mass = False
     cfg.domain_rand.randomize_base_com = False
     cfg.domain_rand.randomize_motor = False
+    cfg.domain_rand.motor_strength_range = [1., 1.]
     cfg.domain_rand.push_robots = False
     cfg.domain_rand.action_delay = True
     cfg.domain_rand.action_curr_step = [1]
