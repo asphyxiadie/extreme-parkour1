@@ -1,0 +1,446 @@
+"""Record four Go2 robots on the original play.py terrain and evaluate 20 episodes each.
+
+Examples (run from legged_gym/legged_gym/scripts):
+  python play2.py --model teacher --teacher-run parkour_new/go2-attn-01 --teacher-checkpoint 14500
+  python play2.py --model moe --moe-run parkour_new/go2-moe-01 --moe-checkpoint 14000
+  python play2.py --model all --fixed-difficulty 0.8 --seed 1234
+"""
+
+import argparse
+import csv
+import json
+import math
+import sys
+from pathlib import Path
+
+import isaacgym  # noqa: F401 -- must precede torch
+from isaacgym import gymapi
+import cv2
+import numpy as np
+import torch
+
+from legged_gym import LEGGED_GYM_ROOT_DIR
+from legged_gym.envs import task_registry
+from legged_gym.envs.base.legged_robot import LeggedRobot
+from legged_gym.utils import get_args
+from legged_gym.utils.helpers import class_to_dict, parse_sim_params, set_seed
+
+
+TERRAIN_NAMES = {15: 'parkour', 16: 'parkour_hurdle', 18: 'parkour_step',
+                 19: 'parkour_gap', 20: 'demo'}
+LANE_NAMES = ('parkour', 'parkour_hurdle', 'parkour_step', 'parkour_gap')
+STEP_FIELDS = ('model', 'env_id', 'terrain', 'terrain_level', 'episode_id', 'step',
+               'time_s', 'goal_index', 'position_x', 'position_y', 'position_z',
+               'target_x', 'target_y', 'command_vx', 'actual_vx', 'world_vx',
+               'roll_rad', 'pitch_rad', 'yaw_rad', 'ang_vel_x', 'ang_vel_y',
+               'body_contact_force_n', 'collision', 'collision_start',
+               'action_delta_abs_mean', 'done', 'video_frame')
+
+
+def snapshot(env, index):
+    root = env.root_states[index]
+    goal_index = int(env.cur_goal_idx[index].item())
+    goal = env.env_goals[index, min(goal_index, env.cfg.terrain.num_goals - 1)]
+    forces = env.contact_forces[index, env.termination_contact_indices]
+    force = float(torch.linalg.vector_norm(forces, dim=-1).max().item()) if forces.numel() else 0.0
+    terrain_class = int(env.env_class[index].item())
+    return dict(
+        terrain=TERRAIN_NAMES.get(terrain_class, f'class_{terrain_class}'),
+        terrain_level=int(env.terrain_levels[index].item()),
+        goal_index=goal_index,
+        position_x=float(root[0].item()), position_y=float(root[1].item()),
+        position_z=float(root[2].item()),
+        target_x=float(goal[0].item()), target_y=float(goal[1].item()),
+        command_vx=float(env.commands[index, 0].item()),
+        actual_vx=float(env.base_lin_vel[index, 0].item()),
+        world_vx=float(root[7].item()),
+        roll_rad=float(env.roll[index].item()), pitch_rad=float(env.pitch[index].item()),
+        yaw_rad=float(env.yaw[index].item()),
+        ang_vel_x=float(env.base_ang_vel[index, 0].item()),
+        ang_vel_y=float(env.base_ang_vel[index, 1].item()),
+        body_contact_force_n=force,
+        timed_out=bool(env.time_out_buf[index].item()))
+
+
+class RecordingRobot(LeggedRobot):
+    def create_sim(self):
+        # Headless video still needs a graphics context, including for the teacher.
+        self.graphics_device_id = self.sim_device_id
+        super().create_sim()
+
+    def _create_envs(self):
+        super()._create_envs()
+        self.record_cameras = []
+        for index, handle in enumerate(self.envs):
+            props = gymapi.CameraProperties()
+            props.width = self.cfg.record_video_width
+            props.height = self.cfg.record_video_height
+            props.horizontal_fov = 80
+            camera = self.gym.create_camera_sensor(handle, props)
+            if camera < 0:
+                raise RuntimeError(f'Cannot create recording camera for env {index}')
+            self.record_cameras.append(camera)
+
+    def reset_idx(self, env_ids):
+        if len(env_ids) and getattr(self, 'record_terminal', False):
+            self.terminal_states = {int(i): snapshot(self, int(i)) for i in env_ids.tolist()}
+        super().reset_idx(env_ids)
+
+
+class VideoRecorder:
+    def __init__(self, env, output, width, height, stride):
+        self.env, self.output = env, output
+        self.width, self.height, self.stride = width, height, stride
+        self.cameras = env.record_cameras
+        self.writers = [None] * env.num_envs
+        self.frames = [0] * env.num_envs
+        self.fps = max(1, round(1 / (env.dt * stride)))
+        (output / 'videos').mkdir(parents=True, exist_ok=True)
+
+    def _open(self, index, episode_id, terrain):
+        path = self.output / 'videos' / f'env{index}_{terrain}_episode{episode_id:02d}.mp4'
+        writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*'mp4v'),
+                                 self.fps, (self.width, self.height))
+        if not writer.isOpened():
+            raise RuntimeError(f'Cannot open MP4 writer: {path}')
+        self.writers[index] = writer
+        self.frames[index] = 0
+        return path
+
+    def capture(self, counts, lengths, terrains, active):
+        """Capture the current state before the next control step can reset an episode."""
+        due = [i for i in range(self.env.num_envs)
+               if active[i] and lengths[i] % self.stride == 0]
+        if not due:
+            return
+        for index in due:
+            root = self.env.root_states[index, :3].detach().cpu().numpy()
+            y = float(root[1])
+            camera_pos = gymapi.Vec3(float(root[0]) - 2.2, y + 3.8, 2.1)
+            look_at = gymapi.Vec3(float(root[0]) + 1.0, y, 0.35)
+            self.env.gym.set_camera_location(self.cameras[index], self.env.envs[index],
+                                             camera_pos, look_at)
+        self.env.gym.step_graphics(self.env.sim)
+        self.env.gym.render_all_camera_sensors(self.env.sim)
+        for index in due:
+            if self.writers[index] is None:
+                self._open(index, counts[index], terrains[index])
+            raw = self.env.gym.get_camera_image(self.env.sim, self.env.envs[index],
+                                                self.cameras[index], gymapi.IMAGE_COLOR)
+            rgba = np.asarray(raw).reshape(self.height, self.width, 4)
+            frame = cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGR)
+            cv2.putText(frame, f'{terrains[index]}  env {index}  episode {counts[index] + 1}',
+                        (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+            self.writers[index].write(frame)
+            self.frames[index] += 1
+
+    def close_episode(self, index):
+        frames = self.frames[index]
+        if self.writers[index] is not None:
+            self.writers[index].release()
+            self.writers[index] = None
+        self.frames[index] = 0
+        return frames
+
+    def close(self):
+        for index in range(len(self.writers)):
+            self.close_episode(index)
+
+
+def parse_args():
+    extra = argparse.ArgumentParser(add_help=False)
+    extra.add_argument('--model', choices=('teacher', 'moe', 'all'), default='all')
+    extra.add_argument('--teacher-run', default='parkour_new/go2-attn-01')
+    extra.add_argument('--teacher-checkpoint', type=int, default=14500)
+    extra.add_argument('--moe-run', default='parkour_new/go2-moe-01')
+    extra.add_argument('--moe-checkpoint', type=int, default=14000)
+    extra.add_argument('--episodes', type=int, default=20, help='Episodes per robot')
+    extra.add_argument('--max-steps', type=int, default=3000)
+    extra.add_argument('--collision-threshold', type=float, default=1.0)
+    extra.add_argument('--video-width', type=int, default=640)
+    extra.add_argument('--video-height', type=int, default=360)
+    extra.add_argument('--video-stride', type=int, default=5,
+                       help='Capture one frame every N control steps')
+    extra.add_argument('--output', default='~/gpufree-data/parkour-data')
+    opts, remaining = extra.parse_known_args()
+    original = sys.argv
+    try:
+        sys.argv = [original[0], *remaining]
+        args = get_args()
+    finally:
+        sys.argv = original
+    if opts.episodes < 1 or opts.max_steps < 2 or opts.video_stride < 1:
+        extra.error('episodes and video-stride must be positive; max-steps must be at least 2')
+    if opts.video_width < 64 or opts.video_height < 64 or opts.collision_threshold < 0:
+        extra.error('video dimensions must be at least 64; collision threshold cannot be negative')
+    if args.fixed_difficulty is not None and not 0 <= args.fixed_difficulty <= 1:
+        extra.error('--fixed-difficulty must be between 0 and 1')
+    if args.graphics_device_id < 0:
+        extra.error('Video recording requires a graphics device (graphics_device_id >= 0)')
+    args.task = 'go2'
+    args.num_envs = 4
+    args.headless = True  # Offscreen cameras still render through graphics_device_id.
+    args.resume = False
+    args.resumeid = None
+    return opts, args
+
+
+def checkpoint_path(run, number):
+    directory = Path(run).expanduser()
+    if not directory.is_absolute() and not directory.is_dir():
+        directory = Path(LEGGED_GYM_ROOT_DIR) / 'logs' / run
+    if number < 0:
+        candidates = sorted((p for p in directory.glob('model_*.pt')
+                             if p.stem.split('_')[-1].isdigit()),
+                            key=lambda p: int(p.stem.split('_')[-1]))
+        if not candidates:
+            raise FileNotFoundError(f'No checkpoints in {directory}')
+        return candidates[-1]
+    path = directory / f'model_{number}.pt'
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    return path
+
+
+def write_csv(path, rows):
+    if not rows:
+        return
+    with path.open('w', newline='') as file:
+        writer = csv.DictWriter(file, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def summarize_episode(model, env_id, episode_id, rows, last, dt, num_goals, frames):
+    fallen = (abs(last['roll_rad']) > 1.5 or abs(last['pitch_rad']) > 1.5
+              or last['position_z'] < -0.25)
+    reason = ('fall' if fallen else 'success' if last['goal_index'] >= num_goals
+              else 'timeout' if last['timed_out'] else 'other')
+    mean = lambda key: sum(r[key] for r in rows) / len(rows)
+    action_deltas = [r['action_delta_abs_mean'] for r in rows
+                     if r['action_delta_abs_mean'] != '']
+    return dict(model=model, env_id=env_id, terrain=rows[0]['terrain'],
+                terrain_level=rows[0]['terrain_level'], episode_id=episode_id,
+                reason=reason, success=int(reason == 'success'),
+                elapsed_s=len(rows) * dt, steps=len(rows),
+                progress=min(1.0, last['goal_index'] / num_goals),
+                mean_command_vx=mean('command_vx'), mean_actual_vx=mean('actual_vx'),
+                mean_abs_speed_error=sum(abs(r['command_vx'] - r['actual_vx']) for r in rows) / len(rows),
+                collision_events=sum(r['collision_start'] for r in rows),
+                collision_rate=sum(r['collision'] for r in rows) / len(rows),
+                collision_duration_s=sum(r['collision'] for r in rows) * dt,
+                max_body_contact_force_n=max(r['body_contact_force_n'] for r in rows),
+                mean_abs_roll_rad=sum(abs(r['roll_rad']) for r in rows) / len(rows),
+                mean_abs_pitch_rad=sum(abs(r['pitch_rad']) for r in rows) / len(rows),
+                rms_ang_vel_xy=math.sqrt(sum(r['ang_vel_x'] ** 2 + r['ang_vel_y'] ** 2
+                                             for r in rows) / len(rows)),
+                action_smoothness=(sum(action_deltas) / len(action_deltas)
+                                   if action_deltas else float('nan')),
+                video_frames=frames,
+                video=f'videos/env{env_id}_{rows[0]["terrain"]}_episode{episode_id:02d}.mp4')
+
+
+def make_cfg(args, opts, model):
+    cfg, train_cfg = task_registry.get_cfgs('go2')
+    cfg.env.num_envs = 4
+    cfg.env.episode_length_s = opts.max_steps * cfg.sim.dt * cfg.control.decimation
+    cfg.commands.resampling_time = cfg.env.episode_length_s + 1
+    cfg.terrain.num_rows = 5
+    cfg.terrain.num_cols = 5
+    cfg.terrain.height = [0.02, 0.02]
+    cfg.terrain.terrain_dict = dict.fromkeys(cfg.terrain.terrain_dict, 0.0)
+    cfg.terrain.terrain_dict.update({name: 0.2 for name in
+                                     ('parkour', 'parkour_hurdle', 'parkour_step',
+                                      'parkour_gap', 'demo')})
+    cfg.terrain.terrain_proportions = list(cfg.terrain.terrain_dict.values())
+    cfg.terrain.curriculum = False
+    cfg.terrain.max_difficulty = True
+    if args.fixed_difficulty is not None:
+        cfg.terrain.fixed_difficulty = args.fixed_difficulty
+    cfg.depth.use_camera = model == 'moe'
+    cfg.record_video_width = opts.video_width
+    cfg.record_video_height = opts.video_height
+    cfg.depth.angle = [0, 1]
+    cfg.depth.dis_noise = 0.0
+    cfg.noise.add_noise = True
+    cfg.domain_rand.randomize_friction = True
+    cfg.domain_rand.push_robots = False
+    cfg.domain_rand.randomize_base_mass = False
+    cfg.domain_rand.randomize_base_com = False
+    cfg.seed = args.seed if args.seed is not None else train_cfg.seed
+    train_cfg.depth_encoder.if_depth = model == 'moe'
+    train_cfg.runner.resume = False
+    return cfg, train_cfg
+
+
+def run_model(model, checkpoint, opts, args, output):
+    cfg, train_cfg = make_cfg(args, opts, model)
+    set_seed(cfg.seed)
+    params = parse_sim_params(args, {'sim': class_to_dict(cfg.sim)})
+    env = RecordingRobot(cfg, params, args.physics_engine, args.sim_device, headless=True)
+    env.record_terminal = True
+    env.terminal_states = {}
+    env.episode_length_buf[:] = 0
+    env.max_episode_length = opts.max_steps - 1
+    env.max_episode_length_s = opts.max_steps * env.dt
+    classes = [TERRAIN_NAMES.get(int(x.item()), str(int(x.item()))) for x in env.env_class]
+    if tuple(classes) != LANE_NAMES:
+        raise RuntimeError(f'Expected four original play2 terrain types, got {classes}')
+    run_dir = output / model
+    run_dir.mkdir(parents=True, exist_ok=True)
+    recorder = None
+    try:
+        required = ('model_state_dict', 'estimator_state_dict')
+        if model == 'moe':
+            required += ('depth_actor_state_dict', 'depth_encoder_state_dict')
+        saved = torch.load(checkpoint, map_location='cpu')
+        missing = [name for name in required if name not in saved]
+        del saved
+        if missing:
+            raise KeyError(f'{checkpoint} missing required model weights: {missing}')
+        runner, _ = task_registry.make_alg_runner(
+            env=env, name='go2', args=args, train_cfg=train_cfg,
+            log_root=None)
+        runner.load(str(checkpoint), load_optimizer=False)
+        if model == 'moe':
+            encoder = runner.get_depth_encoder_inference_policy(device=env.device)
+            actor = runner.get_depth_actor_inference_policy(device=env.device)
+            latent = torch.zeros(env.num_envs, actor.scan_encoder_output_dim, device=env.device)
+            yaw = torch.zeros(env.num_envs, 2, device=env.device)
+            depth = env.depth_buffer[:, -1]
+        else:
+            encoder = None
+            actor = runner.get_actor_critic(device=env.device).actor
+            depth = None
+        recorder = VideoRecorder(env, run_dir, opts.video_width, opts.video_height,
+                                 opts.video_stride)
+        obs = env.get_observations()
+        counts = [0] * 4
+        lengths = [0] * 4
+        active = [[] for _ in range(4)]
+        previous_actions = [None] * 4
+        previous_collision = [False] * 4
+        episodes = []
+        with (run_dir / 'steps.csv').open('w', newline='') as file, torch.no_grad():
+            writer = csv.DictWriter(file, fieldnames=STEP_FIELDS)
+            writer.writeheader()
+            while min(counts) < opts.episodes:
+                recording = [n < opts.episodes for n in counts]
+                recorder.capture(counts, lengths, classes, recording)
+                actor_obs = obs.clone()
+                if encoder is not None:
+                    if depth is not None:
+                        proprio = actor_obs[:, :cfg.env.n_proprio].clone()
+                        proprio[:, 6:8] = 0.0
+                        prediction = encoder(depth.clone(), proprio)
+                        latent = prediction[:, :-2]
+                        yaw = 1.5 * prediction[:, -2:]
+                    actor_obs[:, 6:8] = yaw
+                    actions = actor(actor_obs, hist_encoding=True, scandots_latent=latent)
+                else:
+                    actions = actor(actor_obs, hist_encoding=True)
+                obs, _, _, dones, info = env.step(actions.detach())
+                done_ids = set(dones.nonzero(as_tuple=False).flatten().tolist())
+                for index in range(4):
+                    if counts[index] >= opts.episodes:
+                        continue
+                    state = (env.terminal_states[index] if index in done_ids
+                             else snapshot(env, index))
+                    if state['terrain'] != classes[index]:
+                        raise RuntimeError(f'Env {index} moved to another terrain')
+                    collision = state['body_contact_force_n'] > opts.collision_threshold
+                    action = actions[index].detach().cpu().numpy()
+                    delta = (float(np.abs(action - previous_actions[index]).mean())
+                             if previous_actions[index] is not None else '')
+                    row = {key: state[key] for key in STEP_FIELDS if key in state}
+                    row.update(model=model, env_id=index, episode_id=counts[index],
+                               step=lengths[index] + 1, time_s=(lengths[index] + 1) * env.dt,
+                               collision=int(collision),
+                               collision_start=int(collision and not previous_collision[index]),
+                               action_delta_abs_mean=delta, done=int(index in done_ids),
+                               video_frame=int(lengths[index] % opts.video_stride == 0))
+                    writer.writerow(row)
+                    active[index].append(dict(row, timed_out=state['timed_out']))
+                    lengths[index] += 1
+                    previous_actions[index] = action.copy()
+                    previous_collision[index] = collision
+                    if index in done_ids:
+                        frames = recorder.close_episode(index)
+                        ep = summarize_episode(model, index, counts[index], active[index],
+                                               state, env.dt, cfg.terrain.num_goals, frames)
+                        episodes.append(ep)
+                        counts[index] += 1
+                        lengths[index] = 0
+                        active[index] = []
+                        previous_actions[index] = None
+                        previous_collision[index] = False
+                        print(f'{model}: {classes[index]} {counts[index]}/{opts.episodes} '
+                              f'{ep["reason"]}', flush=True)
+                if done_ids and encoder is not None:
+                    if encoder.hidden_states is not None:
+                        encoder.hidden_states[:, list(done_ids), :] = 0.0
+                    latent[list(done_ids)] = 0.0
+                    yaw[list(done_ids)] = 0.0
+                env.terminal_states.clear()
+                depth = info.get('depth') if encoder is not None else None
+        write_csv(run_dir / 'episodes.csv', episodes)
+        summary = []
+        for index, terrain in enumerate(classes):
+            rows = [r for r in episodes if r['env_id'] == index]
+            successes = [r for r in rows if r['success']]
+            summary.append(dict(model=model, env_id=index, terrain=terrain,
+                                episodes=len(rows), successes=len(successes),
+                                success_rate=len(successes) / len(rows),
+                                fall_rate=sum(r['reason'] == 'fall' for r in rows) / len(rows),
+                                mean_success_time_s=(sum(r['elapsed_s'] for r in successes) / len(successes)
+                                                     if successes else float('nan')),
+                                mean_collision_rate=sum(r['collision_rate'] for r in rows) / len(rows),
+                                mean_collision_events=sum(r['collision_events'] for r in rows) / len(rows),
+                                mean_actual_vx=sum(r['mean_actual_vx'] for r in rows) / len(rows),
+                                mean_abs_speed_error=sum(r['mean_abs_speed_error'] for r in rows) / len(rows),
+                                mean_abs_roll_rad=sum(r['mean_abs_roll_rad'] for r in rows) / len(rows),
+                                mean_abs_pitch_rad=sum(r['mean_abs_pitch_rad'] for r in rows) / len(rows),
+                                mean_rms_ang_vel_xy=sum(r['rms_ang_vel_xy'] for r in rows) / len(rows),
+                                mean_action_smoothness=sum(r['action_smoothness'] for r in rows) / len(rows)))
+        write_csv(run_dir / 'summary.csv', summary)
+        (run_dir / 'metadata.json').write_text(json.dumps(dict(
+            model=model, checkpoint=str(checkpoint), seed=cfg.seed,
+            episodes_per_robot=opts.episodes, max_steps=opts.max_steps,
+            terrain_names=classes, terrain_levels=[int(x.item()) for x in env.terrain_levels],
+            fixed_difficulty=args.fixed_difficulty,
+            default_difficulty_range=[0.7, 1.0] if args.fixed_difficulty is None else None,
+            collision_threshold_n=opts.collision_threshold, control_dt_s=env.dt,
+            video_fps=recorder.fps, video_stride=opts.video_stride,
+            video_note='Frames show the state before each sampled control step; the terminal state is in steps.csv.',
+            success_rule='goal_index >= num_goals and no fall; timeout excludes success',
+            action_smoothness='mean absolute change in the 12 policy actions per control step',
+            depth_update_interval=cfg.depth.update_interval if encoder is not None else None,
+        ), indent=2))
+        print(f'Saved {run_dir}', flush=True)
+    finally:
+        if recorder is not None:
+            recorder.close()
+        env.gym.destroy_sim(env.sim)
+
+
+def main():
+    opts, args = parse_args()
+    output = Path(opts.output).expanduser()
+    output.mkdir(parents=True, exist_ok=True)
+    selections = []
+    if opts.model in ('teacher', 'all'):
+        selections.append(('teacher', checkpoint_path(opts.teacher_run, opts.teacher_checkpoint)))
+    if opts.model in ('moe', 'all'):
+        selections.append(('moe', checkpoint_path(opts.moe_run, opts.moe_checkpoint)))
+    for model, checkpoint in selections:
+        print(f'Evaluating {model}: {checkpoint}', flush=True)
+        run_model(model, checkpoint, opts, args, output)
+    comparison = []
+    for model, _ in selections:
+        with (output / model / 'summary.csv').open(newline='') as file:
+            comparison.extend(csv.DictReader(file))
+    write_csv(output / 'comparison.csv', comparison)
+
+
+if __name__ == '__main__':
+    main()
