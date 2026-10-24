@@ -55,6 +55,7 @@ def get_load_path(root, load_run=-1, checkpoint=-1, model_name_include="model"):
         checkpoint = model.split("_")[-1].split(".")[0]
     return model, checkpoint
 
+@torch.no_grad()
 def play(args):
     if args.web:
         web_viewer = webviewer.WebViewer()
